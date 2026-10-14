@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 dependencies = ["cryptography"]
 
 [project.scripts]
-oidc-issuer = "oidc_issuer.signer:main"
+oidc-issuer = "oidc_issuer.cli:main"
 oidc-token = "oidc_issuer.client:main"
 
 [tool.setuptools.packages.find]

@@ -24,15 +24,15 @@ sequenceDiagram
 
 - **What you get:** `aws sts get-caller-identity --profile myhost` works for
   `alice` on `myhost`, with credentials from a 5-minute token the machine
-  signs for her.
+  signs for `alice`.
 - **Two issuers**, deployable alone or side by side:
 
-  |                 | Simple                             | SPIRE                                        |
-  | --------------- | ---------------------------------- | -------------------------------------------- |
-  | Identities      | Unix users                         | Unix users and systemd units                 |
-  | Signing key     | in the TPM2, never leaves it       | held by SPIRE, rotated weekly                |
-  | Key rotation    | by hand                            | automatic                                    |
-  | Moving parts    | a socket-activated signer, nginx   | SPIRE server, agent and discovery provider   |
+  |              | Simple                                         | SPIRE                                      |
+  | ------------ | ---------------------------------------------- | ------------------------------------------ |
+  | Identities   | Unix users                                     | Unix users and systemd units               |
+  | Signing key  | in the TPM2, never leaves it                   | a file only the SPIRE server reads         |
+  | Key rotation | automatic, weekly                              | automatic, weekly                          |
+  | Moving parts | a socket-activated signer, a rotation timer, nginx | SPIRE server, agent and discovery provider |
 
 - **Requirements:** NixOS 26.05 or later, a TPM 2.0 (with Secure Boot for the
   simple issuer), a domain on Cloudflare, an AWS account, OpenTofu or
@@ -40,7 +40,7 @@ sequenceDiagram
 - **Setup:**
   1. Add the flake and its NixOS module.
   2. Create a Cloudflare tunnel and DNS names with `terraform/cloudflare`.
-  3. Enable an issuer; for the simple one, generate its key.
+  3. Enable an issuer.
   4. Create the AWS providers and roles with `terraform/aws`.
   5. Point an AWS profile at it.
 
@@ -117,58 +117,24 @@ The issuers' `cloudflareTunnel` options add their routes to this tunnel.
 
 ### 3a. The simple issuer
 
-Enable both halves first, without a key:
-
 ```nix
 {
   services.oidc-issuer.simple = {
+    enable = true;
     host = "tokens.example.com";
-    signer = {
-      enable = true;
-      clients = [ "alice" ];
-    };
-    publisher = {
-      enable = true;
-      cloudflareTunnel = "my-tunnel";
-    };
+    clients = [ "alice" ];
+    cloudflareTunnel = "my-tunnel";
   };
 }
 ```
 
-Deploy, then create the signing key in the TPM2:
-
-```sh
-sudo oidc-issuer-keygen
-```
-
-It prints the key's public half. Publish it and sign with it:
-
-```nix
-{
-  services.oidc-issuer.simple = {
-    publicKeys = [
-      {
-        kid = "<kid>";
-        x = "<x>";
-        y = "<y>";
-      }
-    ];
-    signer.activeKid = "<kid>";
-  };
-}
-```
-
-Deploy again. For the very first key both settings go in one deploy: no relying
-party has cached a key set before step 4 registers the issuer. Check it:
+Deploy. The machine generates its first key in the TPM2 and publishes it.
+Check it:
 
 ```sh
 curl https://tokens.example.com/.well-known/jwks.json
-oidc-token claims   # as alice, in a login session that started after step 3a
+oidc-token claims   # as alice, in a login session that started after the deploy
 ```
-
-To run the signer and the publisher on different machines, set `host` and
-`publicKeys` on both, `signer` on the signing machine and `publisher` on the
-publishing one.
 
 ### 3b. The SPIRE issuer
 
@@ -285,7 +251,7 @@ sequenceDiagram
   participant D as tokens.example.com<br/>(Cloudflare → tunnel → nginx)
 
   P->>I: connect to /run/oidc-issuer/token.sock
-  Note over I: the kernel reports the caller's UID (SO_PEERCRED),<br/>which must be a user in signer.clients
+  Note over I: the kernel reports the caller's UID (SO_PEERCRED),<br/>which must be a user in clients
   I->>T: sign the JWT (sub myhost:alice, 5 minutes)
   T-->>I: signature
   I-->>P: token
@@ -296,22 +262,51 @@ sequenceDiagram
 ```
 
 - **Identity:** the caller sends nothing. The socket admits only the
-  `oidc-token` group (the users in `signer.clients`), and the signer checks
-  the list again against the UID the kernel reports for the connection.
+  `oidc-token` group (the users in `clients`), and the signer checks the list
+  again against the UID the kernel reports for the connection.
 - **Signer:** systemd starts one sandboxed `oidc-issuer@` instance per
-  connection. It checks each signature against the published key before
-  replying, and logs every issuance and refusal to the journal.
-- **Key:** an ECDSA P-256 key the TPM2 generated with `fixedtpm|fixedparent`,
-  so it cannot leave that TPM2. On disk are only the key wrapped by the TPM2's
-  storage key and its random auth value, sealed with `systemd-creds` to the
-  TPM2 and the host key in `/var/lib/systemd`. The seal is bound to PCR 7,
+  connection, with the active key's files. It checks each signature against
+  the key's public half before replying, and logs every issuance and refusal
+  to the journal.
+- **Keys:** ECDSA P-256 keys the TPM2 generated with `fixedtpm|fixedparent`,
+  so they cannot leave that TPM2. On disk are only each key wrapped by the
+  TPM2's storage key and its random auth value, sealed with `systemd-creds` to
+  the TPM2 and the host key in `/var/lib/systemd`. The seal is bound to PCR 7,
   which records the Secure Boot state and keys, so it opens only under the
   machine's own Secure Boot chain.
-- **Publisher:** nginx serves the static discovery document and JWKS, built
-  from `publicKeys`, on `127.0.0.1:81`. The signer and the publisher are
-  separate modules and can run on different machines.
+- **Publisher:** nginx serves the discovery document and the JWKS on
+  `127.0.0.1:81`.
 - **Client:** `oidc-token aws --role-arn <ARN>` trades the token for
   credentials and prints them in `credential_process` format.
+
+#### Key rotation
+
+`oidc-issuer-rotate` runs at boot, on deploy and every 5 minutes. Each run
+takes keys one step through their lifecycle and writes the JWKS from every key
+that is not deleted:
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> pending: generated in the TPM2
+  pending --> active: published for 300 s, or at once when no key signs
+  active --> retired: replaced after rotationInterval, or stops working
+  retired --> [*]: deleted once its tokens have expired
+```
+
+- A new key is generated when the active one has signed for
+  `rotationInterval` (a week by default), when a run finds no key that signs,
+  or on `sudo oidc-issuer-rotate-now`.
+- It stays pending for `jwksCacheSeconds` (300), so relying parties' cached
+  key sets include it before it signs. With no key that signs, it activates at
+  once.
+- A key that stops working is retired on the next run and replaced: its sealed
+  auth value no longer opens after a Secure Boot key or dbx update changes
+  PCR 7, and clearing the TPM2 destroys it.
+- A retired key stays published until the tokens it signed have expired, then
+  it is deleted.
+- Every run loads each key in the TPM2 and checks its attributes and public
+  half: the JWKS lists only keys this TPM2 holds.
 
 ### SPIRE
 
@@ -348,23 +343,6 @@ sequenceDiagram
 - **Publisher:** SPIRE's `oidc-discovery-provider` serves the discovery
   document and live JWKS on a Unix socket.
 
-## Rotating the simple issuer's key
-
-1. `sudo oidc-issuer-keygen` on the signing machine.
-2. Add the printed entry to `publicKeys`, next to the current one, and deploy
-   the publisher.
-3. Wait 300 seconds (`jwksCacheSeconds`), so cached key sets include the new
-   key, then set `signer.activeKid` to the new kid and deploy the signer.
-4. Once `signer.tokenLifetime` has passed, remove the old entry and delete
-   `/var/lib/oidc-issuer/<old kid>` on the signing machine.
-
-Generate a new key after any of these:
-
-- a Secure Boot key or dbx update, which changes PCR 7 and leaves the sealed
-  auth value unusable;
-- clearing the TPM2, which destroys the key;
-- any compromise of root on the signing machine.
-
 ## Trust model
 
 - **Identity is per Unix user or systemd unit.** Every process running as a
@@ -373,9 +351,9 @@ Generate a new key after any of these:
 - **Root on the issuing machine can mint a token for any of its subjects**,
   through the TPM2 key (simple) or the SPIRE server's key, and so can anything
   that grants root: sudo rules, SSH agent forwarding, Nix `trusted-users`. The
-  simple issuer's key never leaves the TPM2, so signing ends with access to
-  the machine; its key files and auth value together sign again with any later
-  access to that TPM2.
+  simple issuer's keys never leave the TPM2, so signing ends with access to
+  the machine; a key's files and auth value together sign again with later
+  access to that TPM2 until the key is retired.
 - **AWS trusts whatever JWKS the issuer host serves.** Whoever controls the
   host's DNS record or the tunnel (the Cloudflare API token, the origin
   certificate, the tunnel credentials) controls which keys AWS accepts.
@@ -386,10 +364,10 @@ Generate a new key after any of these:
 
 ## Layout
 
-| Path                    | What it is                                                                     |
-| ----------------------- | ------------------------------------------------------------------------------ |
-| `package/`              | `oidc-issuer` (the signer and keygen) and `oidc-token` (the client), in Python |
-| `modules/simple/`       | the simple issuer: `issuer.nix` (its public data), `signer.nix`, `publisher.nix` |
-| `modules/spire.nix`     | the SPIRE issuer                                                               |
-| `terraform/cloudflare/` | the tunnel and the issuer hosts' DNS records                                   |
-| `terraform/aws/`        | the IAM OIDC providers and the roles that trust them                           |
+| Path                    | What it is                                                                              |
+| ----------------------- | --------------------------------------------------------------------------------------- |
+| `package/`              | `oidc-issuer` (signing and key rotation) and `oidc-token` (the client), in Python       |
+| `modules/simple/`       | the simple issuer: `default.nix` (its options), `signer.nix`, `publisher.nix`           |
+| `modules/spire.nix`     | the SPIRE issuer                                                                        |
+| `terraform/cloudflare/` | the tunnel and the issuer hosts' DNS records                                            |
+| `terraform/aws/`        | the IAM OIDC providers and the roles that trust them                                    |

@@ -68,12 +68,11 @@ def fetch_token(socket_path: str, unit: str) -> str:
                 chunks.append(chunk)
     except FileNotFoundError:
         raise Failure(
-            f"{socket_path} does not exist: the issuer has no active signing key yet "
-            "(sudo oidc-issuer-keygen, then set services.oidc-issuer.simple.signer.activeKid)"
+            f"{socket_path} does not exist: is services.oidc-issuer.simple enabled on this machine?"
         ) from None
     except PermissionError:
         raise Failure(
-            f"no access to {socket_path}: add this user to services.oidc-issuer.simple.signer.clients "
+            f"no access to {socket_path}: add this user to services.oidc-issuer.simple.clients "
             "(a new group membership applies from the next login)"
         ) from None
     except ConnectionRefusedError:
@@ -81,7 +80,10 @@ def fetch_token(socket_path: str, unit: str) -> str:
             f"nothing is listening on {socket_path}: is {unit}.socket running?"
         ) from None
     if not chunks:
-        raise Failure(f"the issuer answered nothing; see journalctl -u '{unit}@*'")
+        # the per-connection unit starts only once there is an active key
+        raise Failure(
+            f"the issuer answered nothing; see journalctl -u {unit}-rotate -u '{unit}@*'"
+        )
     reply = json.loads(b"".join(chunks))
     if "error" in reply:
         raise Failure(f"the issuer refused: {reply['error']}")

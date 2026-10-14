@@ -1,11 +1,10 @@
-# The simple issuer's publishing half: serves the discovery document and JWKS
-# that AWS STS fetches to verify tokens. Both are static, built from
-# services.oidc-issuer.simple, so this needs no access to the signer and can
-# run on any machine.
+# The simple issuer's publishing: serves the discovery document, built from
+# the options, and the JWKS rotation keeps current, which AWS STS fetches to
+# verify tokens.
 #
 # nginx serves them on a loopback port only root can bind. A Cloudflare tunnel
-# (publisher.cloudflareTunnel) or any other HTTPS front for the issuer's host
-# exposes them; the tunnel route passes only the two documents' paths.
+# (cloudflareTunnel) or any other HTTPS front for the issuer's host exposes
+# them; the tunnel route passes only the two documents' paths.
 {
   config,
   lib,
@@ -13,30 +12,17 @@
   ...
 }:
 let
-  issuerCfg = config.services.oidc-issuer.simple;
-  cfg = issuerCfg.publisher;
+  cfg = config.services.oidc-issuer.simple;
   # Below 1024, so only root can bind it: no other local user can stand in
   # for nginx (and serve its own JWKS to AWS) while nginx is down.
   port = 81;
-
-  # URL path -> document
-  documents = {
-    ${issuerCfg.discoveryPath} = issuerCfg.discoveryDocument;
-    ${issuerCfg.jwksPath} = issuerCfg.jwks;
-  };
-
-  webRoot = pkgs.linkFarm "oidc-discovery" (
-    lib.mapAttrs' (
-      path: document:
-      lib.nameValuePair (lib.removePrefix "/" path) (
-        pkgs.writeText (baseNameOf path) (builtins.toJSON document)
-      )
-    ) documents
-  );
+  paths = [
+    cfg.discoveryPath
+    cfg.jwksPath
+  ];
 in
 {
-  options.services.oidc-issuer.simple.publisher = {
-    enable = lib.mkEnableOption "publishing the simple issuer's discovery document and JWKS";
+  options.services.oidc-issuer.simple = {
     origin = lib.mkOption {
       type = lib.types.str;
       readOnly = true;
@@ -58,7 +44,7 @@ in
     services.nginx = {
       enable = true;
       virtualHosts.oidc-discovery = {
-        serverName = issuerCfg.host;
+        serverName = cfg.host;
         # the only server on this address, so no other vhost is reachable
         # through it whatever Host a request carries
         listen = [
@@ -67,22 +53,25 @@ in
             inherit port;
           }
         ];
-        root = webRoot;
         # exact matches for the published documents; everything else 404s
-        locations = lib.genAttrs (map (path: "= ${path}") (lib.attrNames documents)) (_: { }) // {
+        locations = {
+          "= ${cfg.discoveryPath}".alias = pkgs.writeText "openid-configuration" (
+            builtins.toJSON cfg.discoveryDocument
+          );
+          "= ${cfg.jwksPath}".alias = cfg.jwksFile;
           "/".return = "404";
         };
         extraConfig = ''
           default_type application/json;
-          add_header Cache-Control "public, max-age=${toString issuerCfg.jwksCacheSeconds}" always;
+          add_header Cache-Control "public, max-age=${toString cfg.jwksCacheSeconds}" always;
         '';
       };
     };
 
     services.cloudflared.tunnels = lib.mkIf (cfg.cloudflareTunnel != null) {
-      ${cfg.cloudflareTunnel}.ingress.${issuerCfg.host} = {
+      ${cfg.cloudflareTunnel}.ingress.${cfg.host} = {
         service = cfg.origin;
-        path = "^(${lib.concatMapStringsSep "|" lib.escapeRegex (lib.attrNames documents)})$";
+        path = "^(${lib.concatMapStringsSep "|" lib.escapeRegex paths})$";
       };
     };
   };

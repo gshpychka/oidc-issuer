@@ -20,7 +20,7 @@ python3Packages.buildPythonApplication {
   dependencies = [ python3Packages.cryptography ];
 
   pythonImportsCheck = [
-    "oidc_issuer.signer"
+    "oidc_issuer.cli"
     "oidc_issuer.client"
   ];
 }
