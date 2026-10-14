@@ -1,0 +1,18 @@
+[formatter.nixfmt]
+command = "nixfmt"
+includes = ["*.nix"]
+
+[formatter.ruff-format]
+command = "ruff"
+options = ["format"]
+includes = ["*.py"]
+
+[formatter.taplo]
+command = "taplo"
+options = ["format"]
+includes = ["*.toml"]
+
+[formatter.tofu]
+command = "tofu"
+options = ["fmt"]
+includes = ["*.tf"]

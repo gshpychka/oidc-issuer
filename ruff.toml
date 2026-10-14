@@ -1,0 +1,12 @@
+[lint]
+select = [
+  "E4",  # pycodestyle: import placement
+  "E7",  # pycodestyle: statement-level lints
+  "E9",  # pycodestyle: syntax errors
+  "F",   # pyflakes
+  "I",   # isort: import ordering
+  "UP",  # pyupgrade: modern syntax
+  "B",   # flake8-bugbear: likely bugs
+  "C4",  # flake8-comprehensions
+  "SIM", # flake8-simplify
+]
