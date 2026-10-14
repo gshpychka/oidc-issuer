@@ -1,96 +1,56 @@
 # oidc-issuer
 
-Short-lived OIDC tokens for the users and services of a NixOS machine. AWS STS
-trusts them through an IAM OIDC provider, the same way it trusts GitHub Actions'
-tokens, so the machine holds no long-lived AWS keys. Any other relying party
-that accepts OIDC tokens works the same way.
+Short-lived AWS credentials for the users and services of a NixOS machine, with
+no long-lived keys on it. The machine runs its own OIDC issuer, and AWS trusts
+its tokens the way it trusts GitHub Actions'.
 
-The flake has two independent issuers, each with its own host, enable flags and
-NixOS options. Deploy either one, or both side by side.
+```mermaid
+sequenceDiagram
+  box myhost
+    participant P as alice's process
+    participant I as issuer
+  end
+  participant STS as AWS STS
+  participant H as issuer host<br/>(Cloudflare, tunnelled to myhost)
+  P->>I: ask for a token
+  I-->>P: token for alice, valid 5 minutes
+  P->>STS: token, role to assume
+  STS->>H: fetch the issuer's public keys
+  H-->>STS: public keys
+  STS-->>P: temporary credentials
+```
 
-|                    | Simple (`services.oidc-issuer.simple`)                                                             | SPIRE (`services.oidc-issuer.spire`)                                                                 |
-| ------------------ | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Who the caller is  | the Unix user the kernel reports for the connecting process (`SO_PEERCRED`)                        | SPIRE's workload attestation: the Unix user, or the systemd unit                                     |
-| Token subject      | `<hostname>:<user>`                                                                                | `spiffe://<trust domain>/<hostname>/user/<user>` or `.../service/<unit>`                             |
-| Signing key        | generated inside the TPM2, which refuses to export it                                              | SPIRE's disk key manager: a file only the server can read, rotated every 7 days                      |
-| What the TPM2 does | holds the signing key                                                                              | proves to the SPIRE server that the agent runs on this machine (endorsement key hash)                |
-| Key rotation       | by hand, with `oidc-issuer-keygen`                                                                 | automatic                                                                                            |
-| Published keys     | a static JWKS built from the NixOS config, served by nginx on loopback                             | a live JWKS from SPIRE's `oidc-discovery-provider` on a Unix socket                                  |
-| AWS hand-off       | `credential_process = oidc-token aws --role-arn …`                                                 | spiffe-helper keeps `$XDG_RUNTIME_DIR/spiffe/aws.jwt` fresh for a `web_identity_token_file` profile  |
+## At a glance
 
-Each issuer's discovery document and JWKS are public at `https://<host>`. The
-modules route them through a Cloudflare tunnel that passes only those document
-paths, so the machine accepts no inbound connections.
+- **What you get:** `aws sts get-caller-identity --profile myhost` works for
+  `alice` on `myhost`, with credentials from a 5-minute token the machine
+  signs for her.
+- **Two issuers**, deployable alone or side by side:
 
-## How it works
+  |                 | Simple                             | SPIRE                                        |
+  | --------------- | ---------------------------------- | -------------------------------------------- |
+  | Identities      | Unix users                         | Unix users and systemd units                 |
+  | Signing key     | in the TPM2, never leaves it       | held by SPIRE, rotated weekly                |
+  | Key rotation    | by hand                            | automatic                                    |
+  | Moving parts    | a socket-activated signer, nginx   | SPIRE server, agent and discovery provider   |
 
-### Simple
+- **Requirements:** NixOS 26.05 or later, a TPM 2.0 (with Secure Boot for the
+  simple issuer), a domain on Cloudflare, an AWS account, OpenTofu or
+  Terraform.
+- **Setup:**
+  1. Add the flake and its NixOS module.
+  2. Create a Cloudflare tunnel and DNS names with `terraform/cloudflare`.
+  3. Enable an issuer; for the simple one, generate its key.
+  4. Create the AWS providers and roles with `terraform/aws`.
+  5. Point an AWS profile at it.
 
-1. `oidc-token` connects to `/run/oidc-issuer/token.sock`, which only the
-   `oidc-token` group (the users in `signer.clients`) can connect to. It sends
-   nothing.
-2. systemd starts a sandboxed `oidc-issuer@` instance for the connection. The
-   instance reads the caller's UID from the kernel, checks it against
-   `signer.clients`, has the TPM2 sign a JWT (`sub` `<hostname>:<user>`, 5
-   minute lifetime), checks the signature against the published key, and
-   replies with the token. Each issuance and refusal goes to the journal.
-3. `oidc-token aws --role-arn <ARN>` trades the token for credentials with
-   `AssumeRoleWithWebIdentity` and prints them in `credential_process` format.
-4. STS fetches `https://<host>/.well-known/openid-configuration` and the JWKS it
-   points to. Cloudflare passes those two paths through the tunnel to nginx on
-   `127.0.0.1:81`.
-
-The key is an ECDSA P-256 key the TPM2 generated with `fixedtpm|fixedparent`,
-so it cannot leave that TPM2. On disk are only the key wrapped by the TPM2's
-storage key and the key's random auth value, sealed with `systemd-creds` to the
-TPM2 (PCR 7) and the host key in `/var/lib/systemd`. The signer and the
-publisher are separate modules and can run on different machines.
-
-### SPIRE
-
-`spire-server` (loopback only) signs JWT-SVIDs with keys it rotates itself,
-publishing each one days before it signs. `spire-agent` attests to the server
-with the machine's TPM2, and identifies callers of its Workload API socket by
-Unix user and systemd unit. `spire-entries` makes the server's registration
-entries match `users` and `services`, deleting any other entry.
-`oidc-discovery-provider` serves the discovery document and live JWKS on a Unix
-socket. For each user in `users`, a spiffe-helper user service keeps a fresh
-token for AWS in `$XDG_RUNTIME_DIR/spiffe/aws.jwt`.
-
-## Requirements
-
-- **NixOS 26.05 or later**, x86_64-linux or aarch64-linux. The modules run on
-  your system's nixpkgs, and the SPIRE issuer builds on the upstream
-  `services.spire` modules, which 26.05 is the first release to have.
-- **A TPM 2.0**, reachable through the kernel's resource manager at
-  `/dev/tpmrm0`.
-  - Simple: ECC P-256 keys, and an owner hierarchy without an auth value (the
-    Linux default, which `systemd-creds`' own TPM2 sealing also needs).
-  - Simple: **Secure Boot on** (for example with
-    [lanzaboote](https://github.com/nix-community/lanzaboote)). PCR 7 records
-    the Secure Boot state and keys, so the sealed auth value unseals only under
-    the machine's own Secure Boot chain.
-  - SPIRE: the TPM2's endorsement key, whose hash identifies the machine.
-- **A domain in a Cloudflare zone**, and:
-  - an API token with Zone · Zone · Read and Zone · DNS · Edit on that zone,
-    and Account · Cloudflare Tunnel · Edit on its account;
-  - `cloudflared tunnel login`, once, for the origin certificate that fetches
-    the tunnel's credentials;
-  - no bot challenges on the issuer hosts: AWS fetches the documents
-    unattended.
-- **An AWS account**, and credentials that can create IAM OIDC providers and
-  roles.
-- **OpenTofu or Terraform**, 1.6 or later. `nix develop` in this repository
-  gives you `tofu`, `cloudflared` and `aws`.
-- **A secrets mechanism** for NixOS, such as sops-nix or agenix, to put the
-  tunnel's credentials file on the machine.
-
-## Deploying
+## Setup
 
 The examples use `example.com`, a machine named `myhost`, a user `alice` and a
 tunnel named `my-tunnel`. Run the Terraform steps in a clone of this
 repository; each directory keeps its state in a local `terraform.tfstate`
-unless you add a backend.
+unless you add a backend. `nix develop` gives you `tofu`, `cloudflared` and
+`aws`.
 
 ### 1. Add the flake
 
@@ -107,6 +67,10 @@ and add `inputs.oidc-issuer.nixosModules.default` to the machine's modules
 (`nixosModules.simple` or `nixosModules.spire` for just one issuer).
 
 ### 2. Cloudflare tunnel and DNS
+
+The API token needs Zone · Zone · Read and Zone · DNS · Edit on the zone, and
+Account · Cloudflare Tunnel · Edit on its account. AWS fetches the issuer
+hosts' documents unattended, so they need to answer without a bot challenge.
 
 ```sh
 cd terraform/cloudflare
@@ -302,6 +266,87 @@ AWS CLIs and SDKs get fresh credentials from either profile on their own.
 `oidc-token` also prints a bare token (`oidc-token`) or its claims
 (`oidc-token claims`), and `oidc-token aws --region <region>` uses that
 region's STS endpoint.
+
+## How it works
+
+Each issuer has its own host, serving its discovery document and public keys
+over HTTPS. The modules route that host through a Cloudflare tunnel that passes
+only those document paths, so the machine accepts no inbound connections.
+
+### Simple
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as alice's process<br/>(oidc-token)
+  participant I as oidc-issuer@<br/>(one per connection)
+  participant T as TPM2
+  participant STS as AWS STS
+  participant D as tokens.example.com<br/>(Cloudflare → tunnel → nginx)
+
+  P->>I: connect to /run/oidc-issuer/token.sock
+  Note over I: the kernel reports the caller's UID (SO_PEERCRED),<br/>which must be a user in signer.clients
+  I->>T: sign the JWT (sub myhost:alice, 5 minutes)
+  T-->>I: signature
+  I-->>P: token
+  P->>STS: AssumeRoleWithWebIdentity(token, role)
+  STS->>D: discovery document, JWKS
+  D-->>STS: public keys
+  STS-->>P: temporary credentials
+```
+
+- **Identity:** the caller sends nothing. The socket admits only the
+  `oidc-token` group (the users in `signer.clients`), and the signer checks
+  the list again against the UID the kernel reports for the connection.
+- **Signer:** systemd starts one sandboxed `oidc-issuer@` instance per
+  connection. It checks each signature against the published key before
+  replying, and logs every issuance and refusal to the journal.
+- **Key:** an ECDSA P-256 key the TPM2 generated with `fixedtpm|fixedparent`,
+  so it cannot leave that TPM2. On disk are only the key wrapped by the TPM2's
+  storage key and its random auth value, sealed with `systemd-creds` to the
+  TPM2 and the host key in `/var/lib/systemd`. The seal is bound to PCR 7,
+  which records the Secure Boot state and keys, so it opens only under the
+  machine's own Secure Boot chain.
+- **Publisher:** nginx serves the static discovery document and JWKS, built
+  from `publicKeys`, on `127.0.0.1:81`. The signer and the publisher are
+  separate modules and can run on different machines.
+- **Client:** `oidc-token aws --role-arn <ARN>` trades the token for
+  credentials and prints them in `credential_process` format.
+
+### SPIRE
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant H as spiffe-helper<br/>(alice's user service)
+  participant A as spire-agent
+  participant S as spire-server
+  participant SDK as AWS SDK / CLI
+  participant STS as AWS STS
+  participant D as spire.example.com<br/>(Cloudflare → tunnel → discovery provider)
+
+  Note over A,S: the agent attests with the TPM2's endorsement key
+  H->>A: Workload API: token for sts.amazonaws.com
+  Note over A: identifies the caller by Unix user and systemd unit
+  A->>S: sign a JWT-SVID
+  S-->>A: token
+  A-->>H: token
+  H->>H: write $XDG_RUNTIME_DIR/spiffe/aws.jwt
+  SDK->>STS: AssumeRoleWithWebIdentity(aws.jwt, role)
+  STS->>D: discovery document, JWKS
+  D-->>STS: public keys
+  STS-->>SDK: temporary credentials
+```
+
+- **Server:** `spire-server` listens on loopback only. It rotates its JWT
+  signing keys itself and publishes each one days before signing with it.
+- **Agent:** `spire-agent` proves to the server that it runs on this machine
+  with the TPM2's endorsement key, and serves the Workload API on a Unix
+  socket.
+- **Entries:** `spire-entries` makes the server's registration entries match
+  `users` and `services`, deleting any other entry.
+- **Publisher:** SPIRE's `oidc-discovery-provider` serves the discovery
+  document and live JWKS on a Unix socket.
 
 ## Rotating the simple issuer's key
 
