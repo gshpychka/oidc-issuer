@@ -127,8 +127,8 @@ cloudflared tunnel login   # once; writes ~/.cloudflared/cert.pem
 cloudflared tunnel token --cred-file creds.json my-tunnel
 ```
 
-Encrypt `creds.json` into your secrets, delete the plaintext, and run the tunnel
-on the publishing machine:
+Put `creds.json` on the publishing machine as a secret and run the tunnel
+there:
 
 ```nix
 {
@@ -320,28 +320,24 @@ Generate a new key after any of these:
 - clearing the TPM2, which destroys the key;
 - any compromise of root on the signing machine.
 
-## Security notes
+## Trust model
 
-- **Every process of a user holds that user's identity.** Anything running as
-  a client user can get that user's token, coding agents and scripts included.
-  Scope each role to what all of that user's processes may do, and give
-  automation its own user or, with SPIRE, its own systemd unit.
-- **Root on the issuing machine can mint any of its subjects' tokens.** It can
-  use the TPM2 key (simple) or the SPIRE server's key. Treat everything that
-  leads to root as part of the trust base: sudo rules, SSH agent forwarding,
-  Nix `trusted-users`. With the simple issuer, an attacker signs only while
-  they keep access to the machine, but rotate after any compromise: copies of
-  the key files and auth value sign again with any later access to the TPM2.
-- **Whoever controls the issuer host's content controls the issuer.** Anyone
-  who can change the issuer host's DNS or what the tunnel serves can publish
-  their own JWKS and mint tokens for every role that trusts that provider.
-  Guard the Cloudflare API token, the origin certificate and the tunnel
-  credentials like the signing key.
-- **One subject per role, matched exactly.** The Terraform matches `aud` and
-  `sub` with `StringEquals`. Keep session durations short, and alert on
-  `AssumeRoleWithWebIdentity` in CloudTrail.
-- **Tokens live 5 minutes.** STS accepts a token more than once until it
-  expires, so the lifetime bounds what a leaked token is worth.
+- **Identity is per Unix user or systemd unit.** Every process running as a
+  client user can get that user's token; with SPIRE, a unit in `services` has
+  an identity of its own.
+- **Root on the issuing machine can mint a token for any of its subjects**,
+  through the TPM2 key (simple) or the SPIRE server's key, and so can anything
+  that grants root: sudo rules, SSH agent forwarding, Nix `trusted-users`. The
+  simple issuer's key never leaves the TPM2, so signing ends with access to
+  the machine; its key files and auth value together sign again with any later
+  access to that TPM2.
+- **AWS trusts whatever JWKS the issuer host serves.** Whoever controls the
+  host's DNS record or the tunnel (the Cloudflare API token, the origin
+  certificate, the tunnel credentials) controls which keys AWS accepts.
+- **Each role trusts one exact subject.** The roles from `terraform/aws` match
+  `aud` and `sub` with `StringEquals`.
+- **Tokens live 5 minutes**, and STS accepts a token more than once until it
+  expires.
 
 ## Layout
 
